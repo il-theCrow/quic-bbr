@@ -695,6 +695,11 @@ protected:
    * \brief Notify Pacing
    */
   void NotifyPacingPerformed (void);
+  /** 
+   * Send the connection close packet and schedule 
+   * the DoClose method
+   */
+  void ScheduleCloseAndSendConnectionClosePacket();
 
   // Connections to other layers of the Stack
   Ipv4EndPoint* m_endPoint;      //!< the IPv4 endpoint
