@@ -305,6 +305,11 @@ QuicSocketBase::GetTypeId (void)
                      "The current pacing rate, if pacing enabled",
                      MakeTraceSourceAccessor (&QuicSocketBase::m_currentPacingRateTrace),
                      "ns3::DataRateTracedValueCallback")
+    .AddAttribute ("TCB",
+                   "Connection's QuicSocketState object",
+                   PointerValue (),
+                   MakePointerAccessor (&QuicSocketBase::m_tcb),
+                   MakePointerChecker<QuicSocketState> ())
   ;
   return tid;
 }
