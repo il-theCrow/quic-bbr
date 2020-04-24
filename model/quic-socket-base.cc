@@ -61,6 +61,7 @@
 #include "ns3/tcp-option-sack-permitted.h"
 #include "ns3/tcp-option-sack.h"
 #include "ns3/rtt-estimator.h"
+#include "quic-socket-tx-pfifo-scheduler.h"
 #include <math.h>
 #include <algorithm>
 #include <vector>
@@ -221,6 +222,16 @@ QuicSocketBase::GetTypeId (void)
                                          &QuicSocketBase::SetInitialPacketSize),
                    MakeUintegerChecker<uint32_t> (
                     QuicSocketBase::MIN_INITIAL_PACKET_SIZE, UINT32_MAX))
+	.AddAttribute ("SchedulingPolicy",
+				   "Scheduling policy among streams",
+				   TypeIdValue (QuicSocketTxFifoScheduler::GetTypeId ()),
+				   MakeTypeIdAccessor (&QuicSocketBase::m_schedulingTypeId),
+				   MakeTypeIdChecker ())
+	.AddAttribute ("DefaultLatency",
+				   "Default latency bound for the EDF scheduler",
+                   TimeValue (MilliSeconds (100)),
+                   MakeTimeAccessor (&QuicSocketBase::m_defaultLatency),
+                   MakeTimeChecker ())
     .AddAttribute (
                    "LegacyCongestionControl",
                    "When true, use TCP implementations for the congestion control",
@@ -281,7 +292,7 @@ QuicSocketBase::GetTypeId (void)
     //                  MakeTraceSourceAccessor (&QuicSocketBase::m_highRxAckMark),
     //                  "ns3::SequenceNumber32TracedValueCallback")
     .AddTraceSource ("CongestionWindow",
-                     "The TCP connection's congestion window",
+                     "The QUIC connection's congestion window",
                      MakeTraceSourceAccessor (&QuicSocketBase::m_cWndTrace),
                      "ns3::TracedValueCallback::Uint32")
     .AddTraceSource ("SlowStartThreshold",
@@ -501,6 +512,7 @@ QuicSocketBase::QuicSocketBase (void)
 {
   NS_LOG_FUNCTION (this);
 
+
   m_rxBuffer = CreateObject<QuicSocketRxBuffer> ();
   m_txBuffer = CreateObject<QuicSocketTxBuffer> ();
   m_receivedPacketNumbers = std::vector<SequenceNumber32> ();
@@ -597,6 +609,8 @@ QuicSocketBase::QuicSocketBase (const QuicSocketBase& sock)   // Copy constructo
 {
   NS_LOG_FUNCTION (this);
   NS_LOG_LOGIC (this << " invoked the copy constructor");
+  m_lastMaxData = 0;
+  m_maxDataInterval = 10;
 
 //  Callback<void, Ptr< Socket > > vPS = MakeNullCallback<void, Ptr<Socket> > ();
 //  Callback<void, Ptr<Socket>, const Address &> vPSA = MakeNullCallback<void, Ptr<Socket>, const Address &> ();
@@ -994,7 +1008,8 @@ QuicSocketBase::SendPendingData (bool withAck)
     {
       if (m_closeOnEmpty)
         {
-          ScheduleCloseAndSendConnectionClosePacket();
+          m_drainingPeriodEvent.Cancel ();
+          SendConnectionClosePacket (0, "Scheduled connection close - no error");
         }
       NS_LOG_INFO ("Nothing to send");
       return false;
@@ -1067,13 +1082,6 @@ QuicSocketBase::SendPendingData (bool withAck)
               break;
             }
           NS_LOG_DEBUG ("Pacing Timer is not running");
-        }
-
-      // check draining period
-      if (m_drainingPeriodEvent.IsRunning ())
-        {
-          NS_LOG_INFO ("Draining period: no packets can be sent");
-          return false;
         }
         
       // check the state of the socket!
@@ -1505,12 +1513,13 @@ QuicSocketBase::SetReTxTimeout ()
 }
 
 void
-QuicSocketBase::DoRetransmit (std::vector<QuicSocketTxItem*> lostPackets)
+QuicSocketBase::DoRetransmit (std::vector<Ptr<QuicSocketTxItem>> lostPackets)
 {
   NS_LOG_FUNCTION (this);
   // Get packets to retransmit
   SequenceNumber32 next = ++m_tcb->m_nextTxSequence;
   uint32_t toRetx = m_txBuffer->Retransmission (next);
+  NS_LOG_INFO(toRetx << " bytes to retransmit");
   NS_LOG_DEBUG ("Send the retransmitted frame");
   uint32_t win = AvailableWindow ();
   uint32_t connWin = ConnectionWindow ();
@@ -1547,7 +1556,7 @@ QuicSocketBase::ReTxTimeout ()
     }
   else if (m_tcb->m_alarmType == 1 && m_tcb->m_lossTime != 0)
     {
-      std::vector<QuicSocketTxItem*> lostPackets = m_txBuffer->DetectLostPackets ();
+      std::vector<Ptr<QuicSocketTxItem>> lostPackets = m_txBuffer->DetectLostPackets ();
       NS_LOG_INFO ("RTO triggered: early retransmit");
       // Early retransmit or Time Loss Detection.
       if (m_quicCongestionControlLegacy)
@@ -1743,8 +1752,15 @@ QuicSocketBase::Close (void)
         }
       else
         {
-          ScheduleCloseAndSendConnectionClosePacket();
+          m_drainingPeriodEvent.Cancel ();
+          SendConnectionClosePacket (0, "Scheduled connection close - no error");
         }
+      m_idleTimeoutEvent.Cancel ();
+      NS_LOG_LOGIC (
+        this << " Close Schedule DoClose at time " << Simulator::Now ().GetSeconds () << " to expire at time " << (Simulator::Now () + m_drainingPeriodTimeout.Get ()).GetSeconds ());
+      m_drainingPeriodEvent = Simulator::Schedule (m_drainingPeriodTimeout,
+                                                   &QuicSocketBase::DoClose,
+                                                   this);
     }
   else if (m_idleTimeoutEvent.IsExpired () and m_socketState != CLOSING
            and m_socketState != IDLE and m_socketState != LISTENING) //Connection Close due to Idle Period termination
@@ -1940,6 +1956,16 @@ QuicSocketBase::SetConnectionId (uint64_t connectionId)
   NS_LOG_FUNCTION_NOARGS ();
 
   m_connectionId = connectionId;
+}
+
+void
+QuicSocketBase::InitializeScheduling()
+{
+  ObjectFactory schedulerFactory;
+  schedulerFactory.SetTypeId (m_schedulingTypeId);
+  Ptr<QuicSocketTxScheduler> sched = schedulerFactory.Create<QuicSocketTxScheduler> ();
+  m_txBuffer->SetScheduler(sched);
+  SetDefaultLatency(m_defaultLatency);
 }
 
 uint64_t
@@ -2238,11 +2264,21 @@ QuicSocketBase::OnSendingAckFrame ()
   QuicSubheader sub = QuicSubheader::CreateAck (
       largestAcknowledged.GetValue (), ack_delay, largestAcknowledged.GetValue (),
       gaps, additionalAckBlocks);
-  QuicSubheader maxData = QuicSubheader::CreateMaxData(m_quicl5->GetMaxData());
 
   Ptr<Packet> ackFrame = Create<Packet> ();
   ackFrame->AddHeader (sub);
-  ackFrame->AddHeader(maxData);
+
+  if (m_lastMaxData < m_maxDataInterval)
+  {
+	m_lastMaxData++;
+  }
+  else
+  {
+	QuicSubheader maxData = QuicSubheader::CreateMaxData(m_quicl5->GetMaxData());
+	ackFrame->AddHeader(maxData);
+	m_lastMaxData = 0;
+  }
+
   return ackFrame;
 }
 
@@ -2272,7 +2308,7 @@ QuicSocketBase::OnReceivedAckFrame (QuicSubheader &sub)
     and ackBlockCount != gaps.size (),
     "Received Corrupted Ack Frame.");
 
-  std::vector<QuicSocketTxItem*> ackedPackets = m_txBuffer->OnAckUpdate (
+  std::vector<Ptr<QuicSocketTxItem>> ackedPackets = m_txBuffer->OnAckUpdate (
       m_tcb, largestAcknowledged, additionalAckBlocks, gaps);
 
   // Count newly acked bytes
@@ -2293,7 +2329,7 @@ QuicSocketBase::OnReceivedAckFrame (QuicSubheader &sub)
                                  - m_tcb->m_largestSentBeforeRto.GetValue ()) / GetSegSize ();
           uint32_t inFlightBeforeRto = m_txBuffer->BytesInFlight ();
           m_txBuffer->ResetSentList (newPackets);
-          std::vector<QuicSocketTxItem*> lostPackets =
+          std::vector<Ptr<QuicSocketTxItem>> lostPackets =
             m_txBuffer->DetectLostPackets ();
           if (m_quicCongestionControlLegacy && !lostPackets.empty ())
             {
@@ -2320,7 +2356,7 @@ QuicSocketBase::OnReceivedAckFrame (QuicSubheader &sub)
     }
 
   // Find lost packets
-  std::vector<QuicSocketTxItem*> lostPackets =
+  std::vector<Ptr<QuicSocketTxItem>> lostPackets =
     m_txBuffer->DetectLostPackets ();
   // Recover from losses
   if (!lostPackets.empty ())
@@ -2364,7 +2400,7 @@ QuicSocketBase::OnReceivedAckFrame (QuicSubheader &sub)
           NS_LOG_INFO ("Update the variables in the congestion control (legacy), ackedBytes "
                        << ackedBytes << " ackedSegments " << ackedSegments);
           // new acks are ordered from the highest packet number to the smalles
-          QuicSocketTxItem* lastAcked = ackedPackets.at (0);
+          Ptr<QuicSocketTxItem> lastAcked = ackedPackets.at (0);
 
           NS_LOG_LOGIC ("Updating RTT estimate");
           // If the largest acked is newly acked, update the RTT.
@@ -3109,6 +3145,22 @@ uint32_t
 QuicSocketBase::GetInitialPacketSize () const
 {
   return m_initialPacketSize;
+}
+
+void QuicSocketBase::SetLatency(uint32_t streamId, Time latency) {
+	m_txBuffer->SetLatency(streamId, latency);
+}
+
+Time QuicSocketBase::GetLatency(uint32_t streamId) {
+	return m_txBuffer->GetLatency(streamId);
+}
+
+void QuicSocketBase::SetDefaultLatency(Time latency) {
+	m_txBuffer->SetDefaultLatency(latency);
+}
+
+Time QuicSocketBase::GetDefaultLatency() {
+	return m_txBuffer->GetDefaultLatency();
 }
 
 void
