@@ -365,7 +365,7 @@ std::vector<Ptr<QuicSocketTxItem>> QuicSocketTxBuffer::OnAckUpdate(
 				(*sent_it)->m_sacked = true;
 				(*sent_it)->m_ackTime = Now();
 				newlyAcked.push_back((*sent_it));
-				UpdateRateSample((*sent_it));
+				UpdateRateSample ((*sent_it), tcbd);
 			}
 
 		}
@@ -449,11 +449,13 @@ bool QuicSocketTxBuffer::MarkAsLost(const SequenceNumber32 seq) {
 	return found;
 }
 
-uint32_t QuicSocketTxBuffer::Retransmission(SequenceNumber32 packetNumber) {
-	NS_LOG_FUNCTION(this);
+uint32_t
+QuicSocketTxBuffer::Retransmission (SequenceNumber32 packetNumber)
+{
+	NS_LOG_FUNCTION (this);
 	uint32_t toRetx = 0;
 	// First pass: add lost packets to the application buffer
-	for (auto sent_it = m_sentList.rbegin(); sent_it != m_sentList.rend();
+	for (auto sent_it = m_sentList.begin (); sent_it != m_sentList.end ();
 			++sent_it) {
 		Ptr<QuicSocketTxItem> item = *sent_it;
 		if (item->m_lost) {
@@ -463,26 +465,30 @@ uint32_t QuicSocketTxBuffer::Retransmission(SequenceNumber32 packetNumber) {
 			retx->m_isStream = item->m_isStream;
 			retx->m_isStream0 = item->m_isStream0;
 			retx->m_packet = Create<Packet>();
-			NS_LOG_INFO(
-					"Retx packet " << item->m_packetNumber << " as "<< retx->m_packetNumber.GetValue ());
+			NS_LOG_INFO (
+					"Retx packet " << item->m_packetNumber << " as "
+					<< retx->m_packetNumber.GetValue ());
 			QuicSocketTxItem::MergeItems(*retx, *item);
 			retx->m_lost = false;
 			retx->m_retrans = true;
 			toRetx += retx->m_packet->GetSize();
 			m_sentSize -= retx->m_packet->GetSize();
-			if (retx->m_isStream0) {
-				NS_LOG_INFO("Lost stream 0 packet, re-inserting in list");
-				m_streamZeroList.insert(m_streamZeroList.begin(), retx);
-				m_streamZeroSize += retx->m_packet->GetSize();
-				m_numFrameStream0InBuffer++;
-			} else {
-				m_scheduler->Add(retx, true);
-			}
+			if (retx->m_isStream0)
+				{
+					NS_LOG_INFO("Lost stream 0 packet, re-inserting in list");
+					m_streamZeroList.insert(m_streamZeroList.begin(), retx);
+					m_streamZeroSize += retx->m_packet->GetSize();
+					m_numFrameStream0InBuffer++;
+				}
+			else 
+				{
+					m_scheduler->Add(retx, true);
+				}
 		}
 	}
 
-	NS_LOG_LOGIC("Remove retransmitted packets from sent list");
-	auto sent_it = m_sentList.begin();
+	NS_LOG_LOGIC ("Remove retransmitted packets from sent list");
+	auto sent_it = m_sentList.begin ();
 	// Remove lost packets from the sent list
 	while (!m_sentList.empty() && sent_it != m_sentList.end()) {
 		Ptr<QuicSocketTxItem> item = *sent_it;
@@ -577,26 +583,24 @@ uint32_t QuicSocketTxBuffer::BytesInFlight() const {
 
 }
 
-void QuicSocketTxBuffer::SetQuicSocketState(Ptr<QuicSocketState> tcb) {
-	NS_LOG_FUNCTION(this);
-	m_tcb = tcb;
-}
-
 void QuicSocketTxBuffer::SetScheduler(Ptr<QuicSocketTxScheduler> sched) {
 	NS_LOG_FUNCTION(this);
 	m_scheduler = sched;
 }
 
-void QuicSocketTxBuffer::UpdatePacketSent(SequenceNumber32 seq, uint32_t sz) {
+void
+QuicSocketTxBuffer::UpdatePacketSent (SequenceNumber32 seq, uint32_t sz,
+		Ptr<QuicSocketState> tcb)
+{
 	NS_LOG_FUNCTION(this << seq << sz);
 
-	if (m_tcb == nullptr or sz == 0) {
+	if (tcb == nullptr or sz == 0) {
 		return;
 	}
 
-	if (m_tcb->m_bytesInFlight.Get() == 0) {
-		m_tcb->m_firstSentTime = Simulator::Now();
-		m_tcb->m_deliveredTime = Simulator::Now();
+	if (tcb->m_bytesInFlight.Get() == 0) {
+		tcb->m_firstSentTime = Simulator::Now();
+		tcb->m_deliveredTime = Simulator::Now();
 	}
 
 	Ptr<QuicSocketTxItem> item = nullptr;
@@ -607,10 +611,10 @@ void QuicSocketTxBuffer::UpdatePacketSent(SequenceNumber32 seq, uint32_t sz) {
 		}
 	}
 	NS_ASSERT_MSG(item != nullptr, "not found seq " << seq);
-	item->m_firstSentTime = m_tcb->m_firstSentTime;
-	item->m_deliveredTime = m_tcb->m_deliveredTime;
-	item->m_isAppLimited = (m_tcb->m_appLimitedUntil > m_tcb->m_delivered);
-	item->m_delivered = m_tcb->m_delivered;
+	item->m_firstSentTime = tcb->m_firstSentTime;
+	item->m_deliveredTime = tcb->m_deliveredTime;
+	item->m_isAppLimited = (tcb->m_appLimitedUntil > tcb->m_delivered);
+	item->m_delivered = tcb->m_delivered;
 }
 
 
@@ -622,18 +626,18 @@ QuicSocketTxBuffer::GetRateSample ()
 }
 
 void
-QuicSocketTxBuffer::UpdateRateSample (Ptr<QuicSocketTxItem> item)
+QuicSocketTxBuffer::UpdateRateSample (Ptr<QuicSocketTxItem> item, Ptr<QuicSocketState> tcb)
 {
   NS_LOG_FUNCTION (this << item);
 
-  if (m_tcb == nullptr or item->m_deliveredTime == Time::Max ())
+  if (tcb == nullptr or item->m_deliveredTime == Time::Max () or item->m_isStream0)
     {
       // item already SACKed
       return;
     }
 
-  m_tcb->m_delivered         += item->m_packet->GetSize ();;
-  m_tcb->m_deliveredTime      = Simulator::Now ();
+  tcb->m_delivered         += item->m_packet->GetSize ();;
+  tcb->m_deliveredTime      = Simulator::Now ();
 
   if (item->m_delivered > m_rs.m_priorDelivered)
     {
@@ -641,23 +645,23 @@ QuicSocketTxBuffer::UpdateRateSample (Ptr<QuicSocketTxItem> item)
       m_rs.m_priorTime        = item->m_deliveredTime;
       m_rs.m_isAppLimited     = item->m_isAppLimited;
       m_rs.m_sendElapsed      = item->m_lastSent - item->m_firstSentTime;
-      m_rs.m_ackElapsed       = m_tcb->m_deliveredTime - item->m_deliveredTime;
-      m_tcb->m_firstSentTime  = item->m_lastSent;
+      m_rs.m_ackElapsed       = tcb->m_deliveredTime - item->m_deliveredTime;
+      tcb->m_firstSentTime  = item->m_lastSent;
     }
 
   /* Mark the packet as delivered once it is SACKed to avoid
    * being used again when it's cumulatively acked.
    */
   item->m_deliveredTime = Time::Max ();
-  m_tcb->m_txItemDelivered = item->m_delivered;
+  tcb->m_txItemDelivered = item->m_delivered;
 }
 
 bool
-QuicSocketTxBuffer::GenerateRateSample ()
+QuicSocketTxBuffer::GenerateRateSample (Ptr<QuicSocketState> tcb)
 {
   NS_LOG_FUNCTION (this);
 
-  if (m_tcb == nullptr)
+  if (tcb == nullptr)
     {
       return false;
     }
@@ -669,9 +673,9 @@ QuicSocketTxBuffer::GenerateRateSample ()
 
   m_rs.m_interval = std::max (m_rs.m_sendElapsed, m_rs.m_ackElapsed);
 
-  m_rs.m_delivered = m_tcb->m_delivered - m_rs.m_priorDelivered;
+  m_rs.m_delivered = tcb->m_delivered - m_rs.m_priorDelivered;
 
-  if (m_rs.m_interval < m_tcb->m_minRtt)
+  if (m_rs.m_interval < tcb->m_minRtt)
     {
       m_rs.m_interval = Seconds (0);
       return false;

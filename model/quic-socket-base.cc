@@ -521,7 +521,6 @@ QuicSocketBase::QuicSocketBase (void)
   m_tcb->m_cWnd = m_tcb->m_initialCWnd;
   m_tcb->m_ssThresh = m_tcb->m_initialSsThresh;
   m_quicCongestionControlLegacy = false;
-  m_txBuffer->SetQuicSocketState(m_tcb);
 
   m_tcb->m_currentPacingRate = m_tcb->m_maxPacingRate;
   m_pacingTimer.SetFunction (&QuicSocketBase::NotifyPacingPerformed, this);
@@ -629,7 +628,6 @@ QuicSocketBase::QuicSocketBase (const QuicSocketBase& sock)   // Copy constructo
       m_congestionControl = sock.m_congestionControl->Fork ();
     }
   m_quicCongestionControlLegacy = sock.m_quicCongestionControlLegacy;
-  m_txBuffer->SetQuicSocketState(m_tcb);
 
   m_tcb->m_currentPacingRate = m_tcb->m_maxPacingRate;
   m_pacingTimer.SetFunction (&QuicSocketBase::NotifyPacingPerformed, this);
@@ -1093,12 +1091,6 @@ QuicSocketBase::SendPendingData (bool withAck)
 
       uint32_t availableData = m_txBuffer->AppSize ();
 
-  	  if(availableData < availableWindow and !m_closeOnEmpty)
-  	  {
-        NS_LOG_INFO("Ask the app for more data before trying to send");
-  		  NotifySend(GetTxAvailable());
-  	  }
-
       if (availableWindow < GetSegSize () and availableData > availableWindow and !m_closeOnEmpty)
         {
           NS_LOG_INFO ("Preventing Silly Window Syndrome. Wait to Send.");
@@ -1425,7 +1417,7 @@ QuicSocketBase::SendDataPacket (SequenceNumber32 packetNumber,
   m_txTrace (p, head, this);
   NotifyDataSent (sz);
 
-  m_txBuffer->UpdatePacketSent(packetNumber, sz);
+  m_txBuffer->UpdatePacketSent(packetNumber, sz, m_tcb);
 
   if (!m_quicCongestionControlLegacy)
     {
@@ -1435,6 +1427,12 @@ QuicSocketBase::SendDataPacket (SequenceNumber32 packetNumber,
   if (!isAckOnly)
     {
       SetReTxTimeout ();
+    }
+
+  // notify the application that more data can be sent
+  if (GetTxAvailable () > 0)
+    {
+      NotifySend (GetTxAvailable ());
     }
 
   return sz;
@@ -1515,23 +1513,10 @@ QuicSocketBase::DoRetransmit (std::vector<Ptr<QuicSocketTxItem>> lostPackets)
 {
   NS_LOG_FUNCTION (this);
   // Get packets to retransmit
-  SequenceNumber32 next = ++m_tcb->m_nextTxSequence;
+  SequenceNumber32 next = m_tcb->m_nextTxSequence + 1;
   uint32_t toRetx = m_txBuffer->Retransmission (next);
   NS_LOG_INFO(toRetx << " bytes to retransmit");
-  NS_LOG_DEBUG ("Send the retransmitted frame");
-  uint32_t win = AvailableWindow ();
-  uint32_t connWin = ConnectionWindow ();
-  uint32_t bytesInFlight = BytesInFlight ();
-  NS_LOG_DEBUG (
-    "BEFORE Available Window " << win
-                               << " Connection RWnd " << connWin
-                               << " BytesInFlight " << bytesInFlight
-                               << " BufferedSize " << m_txBuffer->AppSize ()
-                               << " MaxPacketSize " << GetSegSize ());
-
-  // Send the retransmitted data
-  NS_LOG_INFO ("Retransmitted packet, next sequence number " << m_tcb->m_nextTxSequence);
-  SendDataPacket (next, toRetx, m_connected);
+  SendPendingData (m_connected);
 }
 
 void
@@ -2312,7 +2297,7 @@ QuicSocketBase::OnReceivedAckFrame (QuicSubheader &sub)
   // Count newly acked bytes
   uint32_t ackedBytes = previousWindow - m_txBuffer->BytesInFlight ();
 
-  m_txBuffer->GenerateRateSample ();
+  m_txBuffer->GenerateRateSample (m_tcb);
   rs->m_packetLoss = std::abs ((int) lostOut - (int) m_txBuffer->GetLost ());
   m_tcb->m_lastAckedSackedBytes = m_tcb->m_delivered - delivered;
 
